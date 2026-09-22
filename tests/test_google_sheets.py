@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from googleapiclient.errors import HttpError
 
 from src.google_sheets import (
+    GoogleSheetsAPIError,
     GoogleSheetsClient,
+    GoogleSheetsValidationError,
     SheetAlreadyExistsError,
     SheetNotFoundError,
 )
+
+
+def _http_error(status: int) -> HttpError:
+    return HttpError(
+        resp=SimpleNamespace(status=status, reason="error"),
+        content=b"{}",
+    )
 
 
 def _build_client_with_mocks():
@@ -21,7 +32,7 @@ def _build_client_with_mocks():
     return credentials, service, spreadsheets, values, service_builder
 
 
-def _build_client_with_service():
+def _build_client_with_service(retry_sleep=None):
     service = MagicMock()
     spreadsheets = service.spreadsheets.return_value
     values = spreadsheets.values.return_value
@@ -29,6 +40,7 @@ def _build_client_with_service():
         spreadsheet_id="spreadsheet-id",
         credentials_path="credentials/service-account.json",
         service=service,
+        retry_sleep=retry_sleep,
     )
     return client, service, spreadsheets, values
 
@@ -369,3 +381,178 @@ def test_freeze_rows_updates_sheet_properties() -> None:
             ]
         },
     )
+
+
+def test_batch_write_ranges_sends_single_values_batch_update() -> None:
+    client, _, _, values = _build_client_with_service()
+    values.batchUpdate.return_value.execute.return_value = {"totalUpdatedCells": 4}
+
+    result = client.batch_write_ranges(
+        [
+            ("Sheet1!A1", [["Title"]]),
+            ("Sheet1!A3:B3", [["Label", "Value"]]),
+        ]
+    )
+
+    assert result == {"totalUpdatedCells": 4}
+    values.batchUpdate.assert_called_once_with(
+        spreadsheetId="spreadsheet-id",
+        body={
+            "valueInputOption": "RAW",
+            "data": [
+                {"range": "Sheet1!A1", "values": [["Title"]]},
+                {"range": "Sheet1!A3:B3", "values": [["Label", "Value"]]},
+            ],
+        },
+    )
+
+
+def test_batch_write_ranges_requires_at_least_one_entry() -> None:
+    client, _, _, _ = _build_client_with_service()
+
+    with pytest.raises(GoogleSheetsValidationError):
+        client.batch_write_ranges([])
+
+
+def test_batch_update_combines_multiple_requests_in_one_call() -> None:
+    client, _, spreadsheets, _ = _build_client_with_service()
+    spreadsheets.batchUpdate.return_value.execute.return_value = {"replies": []}
+    sheet_id = 42
+
+    requests = [
+        client.build_merge_request(sheet_id, 0, 1, 0, 3),
+        client.build_freeze_rows_request(sheet_id, 1),
+    ]
+    result = client.batch_update(requests)
+
+    assert result == {"replies": []}
+    spreadsheets.get.assert_not_called()
+    spreadsheets.batchUpdate.assert_called_once_with(
+        spreadsheetId="spreadsheet-id",
+        body={"requests": requests},
+    )
+
+
+def test_batch_update_requires_at_least_one_request() -> None:
+    client, _, _, _ = _build_client_with_service()
+
+    with pytest.raises(GoogleSheetsValidationError):
+        client.batch_update([])
+
+
+def test_delete_sheet_by_id_skips_metadata_lookup() -> None:
+    client, _, spreadsheets, _ = _build_client_with_service()
+    spreadsheets.batchUpdate.return_value.execute.return_value = {"replies": []}
+
+    client.delete_sheet_by_id(999)
+
+    spreadsheets.get.assert_not_called()
+    spreadsheets.batchUpdate.assert_called_once_with(
+        spreadsheetId="spreadsheet-id",
+        body={"requests": [{"deleteSheet": {"sheetId": 999}}]},
+    )
+
+
+def test_metadata_read_retries_on_429_then_succeeds() -> None:
+    sleep_calls: list[float] = []
+    client, _, spreadsheets, _ = _build_client_with_service(retry_sleep=sleep_calls.append)
+    spreadsheets.get.return_value.execute.side_effect = [
+        _http_error(429),
+        {"sheets": [{"properties": {"title": "Summary"}}]},
+    ]
+
+    result = client.get_sheet_names()
+
+    assert result == ["Summary"]
+    assert spreadsheets.get.return_value.execute.call_count == 2
+    assert sleep_calls == [0.5]
+
+
+def test_write_range_retries_on_transient_5xx_then_succeeds() -> None:
+    sleep_calls: list[float] = []
+    client, _, _, values = _build_client_with_service(retry_sleep=sleep_calls.append)
+    values.update.return_value.execute.side_effect = [
+        _http_error(503),
+        {"updatedCells": 2},
+    ]
+
+    result = client.write_range("Sheet1!A1:B1", [["a", "b"]])
+
+    assert result == {"updatedCells": 2}
+    assert values.update.return_value.execute.call_count == 2
+    assert sleep_calls == [0.5]
+
+
+def test_batch_update_retries_transient_5xx_then_succeeds() -> None:
+    sleep_calls: list[float] = []
+    client, _, spreadsheets, _ = _build_client_with_service(retry_sleep=sleep_calls.append)
+    spreadsheets.batchUpdate.return_value.execute.side_effect = [
+        _http_error(500),
+        {"replies": []},
+    ]
+
+    result = client.batch_update([{"mergeCells": {}}])
+
+    assert result == {"replies": []}
+    assert spreadsheets.batchUpdate.return_value.execute.call_count == 2
+    assert sleep_calls == [0.5]
+
+
+def test_retryable_operation_stops_after_max_attempts() -> None:
+    sleep_calls: list[float] = []
+    client, _, spreadsheets, _ = _build_client_with_service(retry_sleep=sleep_calls.append)
+    spreadsheets.get.return_value.execute.side_effect = [
+        _http_error(429),
+        _http_error(429),
+        _http_error(429),
+    ]
+
+    with pytest.raises(GoogleSheetsAPIError, match="429"):
+        client.get_sheet_names()
+
+    # DEFAULT_MAX_RETRY_ATTEMPTS = 3: two retries after the first attempt.
+    assert spreadsheets.get.return_value.execute.call_count == 3
+    assert sleep_calls == [0.5, 1.0]
+
+
+def test_non_retryable_status_is_not_retried() -> None:
+    sleep_calls: list[float] = []
+    client, _, spreadsheets, _ = _build_client_with_service(retry_sleep=sleep_calls.append)
+    spreadsheets.get.return_value.execute.side_effect = _http_error(403)
+
+    with pytest.raises(GoogleSheetsAPIError, match="403"):
+        client.get_sheet_names()
+
+    assert spreadsheets.get.return_value.execute.call_count == 1
+    assert sleep_calls == []
+
+
+def test_create_sheet_is_not_retried_on_retryable_status() -> None:
+    """Worksheet creation must never be automatically retried, even on a
+    status code that would be retryable for other operations, because a
+    retry after an ambiguous failure could create a duplicate sheet.
+    """
+    sleep_calls: list[float] = []
+    client, _, spreadsheets, _ = _build_client_with_service(retry_sleep=sleep_calls.append)
+    spreadsheets.get.return_value.execute.return_value = {"sheets": []}
+    spreadsheets.batchUpdate.return_value.execute.side_effect = _http_error(429)
+
+    with pytest.raises(GoogleSheetsAPIError, match="429"):
+        client.create_sheet("New Sheet")
+
+    assert spreadsheets.batchUpdate.return_value.execute.call_count == 1
+    assert sleep_calls == []
+
+
+def test_delete_sheet_by_id_retries_on_transient_failure() -> None:
+    sleep_calls: list[float] = []
+    client, _, spreadsheets, _ = _build_client_with_service(retry_sleep=sleep_calls.append)
+    spreadsheets.batchUpdate.return_value.execute.side_effect = [
+        _http_error(503),
+        {"replies": []},
+    ]
+
+    client.delete_sheet_by_id(123)
+
+    assert spreadsheets.batchUpdate.return_value.execute.call_count == 2
+    assert sleep_calls == [0.5]

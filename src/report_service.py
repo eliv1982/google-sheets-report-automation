@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from src.google_sheets import GoogleSheetsClient
 from src.models import CreditDeal, ReportParameters, ReportSummary
 from src import report_styles
+
+logger = logging.getLogger(__name__)
 
 
 class CreditPortfolioReportService:
@@ -92,17 +95,28 @@ class CreditPortfolioReportService:
         generated_at = self._normalize_datetime(self._now_provider())
         summary = self.calculate_summary(self.deals)
         sheet_name = self.build_unique_sheet_name(generated_at=generated_at)
-        created_sheet = False
+        sheet_id: int | None = None
 
         try:
-            self.client.create_sheet(sheet_name)
-            created_sheet = True
+            # Capture the sheet id returned by creation so later formatting
+            # and cleanup calls can reuse it instead of re-fetching
+            # spreadsheet metadata.
+            sheet_id = self.client.create_sheet(sheet_name)
             self._write_report(sheet_name, summary, generated_at)
-            self._apply_formatting(sheet_name, len(self.deals))
+            self._apply_formatting(sheet_name, sheet_id, len(self.deals))
             return sheet_name
-        except Exception:
-            if created_sheet:
-                self._cleanup_created_sheet(sheet_name)
+        except Exception as generation_error:
+            if sheet_id is not None:
+                try:
+                    self._cleanup_created_sheet(sheet_name, sheet_id)
+                except Exception as cleanup_error:
+                    logger.error(
+                        "Cleanup failed for report sheet '%s' after report "
+                        "generation failed: %s",
+                        sheet_name,
+                        cleanup_error,
+                        exc_info=cleanup_error,
+                    )
             raise
 
     def _write_report(
@@ -112,11 +126,7 @@ class CreditPortfolioReportService:
         generated_at: datetime,
     ) -> None:
         last_column_letter = self._column_letter(len(self.DETAIL_HEADERS))
-        self.client.write_range(
-            self._sheet_range(sheet_name, "A1"),
-            [[self.TITLE]],
-        )
-        self.client.merge_cells(sheet_name, 0, 1, 0, len(self.DETAIL_HEADERS))
+        risk_title_row = self.DETAIL_HEADER_ROW + len(self.deals) + 2
 
         metadata_rows = [
             [
@@ -127,237 +137,180 @@ class CreditPortfolioReportService:
             ["Reporting Currency", self.parameters.reporting_currency],
             ["Generated At", generated_at.strftime("%Y-%m-%d %H:%M:%S")],
         ]
-        self.client.write_range(
-            self._sheet_range(sheet_name, "A3:B6"),
-            metadata_rows,
-        )
 
-        self.client.write_range(
-            self._sheet_range(sheet_name, "A8"),
-            [["KEY METRICS"]],
-        )
-        self.client.merge_cells(sheet_name, 7, 8, 0, 6)
-        self.client.write_range(
-            self._sheet_range(sheet_name, "A9:F11"),
-            [
+        entries: list[tuple[str, list[list[object]]]] = [
+            (self._sheet_range(sheet_name, "A1"), [[self.TITLE]]),
+            (self._sheet_range(sheet_name, "A3:B6"), metadata_rows),
+            (self._sheet_range(sheet_name, "A8"), [["KEY METRICS"]]),
+            (
+                self._sheet_range(sheet_name, "A9:F11"),
                 [
-                    "Total Deals",
-                    summary.total_deals,
-                    "Approved Limit",
-                    summary.total_approved_limit,
-                    "Outstanding Amount",
-                    summary.total_outstanding,
+                    [
+                        "Total Deals",
+                        summary.total_deals,
+                        "Approved Limit",
+                        summary.total_approved_limit,
+                        "Outstanding Amount",
+                        summary.total_outstanding,
+                    ],
+                    [
+                        "Average Interest Rate",
+                        summary.average_interest_rate,
+                        "Active Deals",
+                        summary.active_deals,
+                        "High Risk Deals",
+                        summary.high_risk_deals,
+                    ],
+                    [
+                        "Closed Deals",
+                        summary.closed_deals,
+                        "Low Risk Deals",
+                        summary.low_risk_deals,
+                        "Medium Risk Deals",
+                        summary.medium_risk_deals,
+                    ],
                 ],
-                [
-                    "Average Interest Rate",
-                    summary.average_interest_rate,
-                    "Active Deals",
-                    summary.active_deals,
-                    "High Risk Deals",
-                    summary.high_risk_deals,
-                ],
-                [
-                    "Closed Deals",
-                    summary.closed_deals,
-                    "Low Risk Deals",
-                    summary.low_risk_deals,
-                    "Medium Risk Deals",
-                    summary.medium_risk_deals,
-                ],
-            ],
-        )
-
-        self.client.write_range(
-            self._sheet_range(
-                sheet_name,
-                f"A{self.DETAIL_HEADER_ROW}:{last_column_letter}{self.DETAIL_HEADER_ROW}",
             ),
-            [list(self.DETAIL_HEADERS)],
-        )
+            (
+                self._sheet_range(
+                    sheet_name,
+                    f"A{self.DETAIL_HEADER_ROW}:{last_column_letter}{self.DETAIL_HEADER_ROW}",
+                ),
+                [list(self.DETAIL_HEADERS)],
+            ),
+            (self._sheet_range(sheet_name, f"A{risk_title_row}"), [["Risk Overview"]]),
+            (
+                self._sheet_range(sheet_name, f"A{risk_title_row + 1}:B{risk_title_row + 3}"),
+                [
+                    ["Low", summary.low_risk_deals],
+                    ["Medium", summary.medium_risk_deals],
+                    ["High", summary.high_risk_deals],
+                ],
+            ),
+        ]
+
         if self.deals:
             detail_start_row = self.DETAIL_HEADER_ROW + 1
             detail_end_row = detail_start_row + len(self.deals) - 1
-            self.client.write_range(
-                self._sheet_range(
-                    sheet_name,
-                    f"A{detail_start_row}:{last_column_letter}{detail_end_row}",
-                ),
-                [self._deal_to_row(deal) for deal in self.deals],
+            entries.append(
+                (
+                    self._sheet_range(
+                        sheet_name,
+                        f"A{detail_start_row}:{last_column_letter}{detail_end_row}",
+                    ),
+                    [self._deal_to_row(deal) for deal in self.deals],
+                )
             )
 
-        risk_title_row = self.DETAIL_HEADER_ROW + len(self.deals) + 2
-        self.client.write_range(
-            self._sheet_range(sheet_name, f"A{risk_title_row}"),
-            [["Risk Overview"]],
-        )
-        self.client.merge_cells(sheet_name, risk_title_row - 1, risk_title_row, 0, 4)
-        self.client.write_range(
-            self._sheet_range(sheet_name, f"A{risk_title_row + 1}:B{risk_title_row + 3}"),
-            [
-                ["Low", summary.low_risk_deals],
-                ["Medium", summary.medium_risk_deals],
-                ["High", summary.high_risk_deals],
-            ],
+        self.client.batch_write_ranges(
+            entries, action=f"writing report data to sheet '{sheet_name}'"
         )
 
-    def _apply_formatting(self, sheet_name: str, deal_count: int) -> None:
+    def _apply_formatting(self, sheet_name: str, sheet_id: int, deal_count: int) -> None:
+        """Build every merge/format/dimension/freeze request for the report
+        and send them together in a single batchUpdate call, reusing the
+        sheet id captured at creation time instead of looking it up again.
+        """
         detail_row_start = self.DETAIL_HEADER_ROW
         detail_row_end = detail_row_start + deal_count
         risk_title_row = self.DETAIL_HEADER_ROW + deal_count + 2
+        header_count = len(self.DETAIL_HEADERS)
+        build_format = self.client.build_format_request
+        build_merge = self.client.build_merge_request
+        build_row_height = self.client.build_row_height_request
+        build_column_width = self.client.build_column_width_request
 
-        self.client.format_range(
-            sheet_name,
-            0,
-            1,
-            0,
-            len(self.DETAIL_HEADERS),
-            **report_styles.TITLE_CELL_FORMAT,
-        )
-        self.client.set_row_height(sheet_name, 0, 1, report_styles.TITLE_ROW_HEIGHT)
-
-        self.client.format_range(sheet_name, 2, 6, 0, 1, **report_styles.LABEL_FORMAT)
-        self.client.format_range(sheet_name, 2, 6, 1, 2, **report_styles.BODY_FORMAT)
-
-        self.client.format_range(sheet_name, 7, 8, 0, 6, **report_styles.SECTION_TITLE_FORMAT)
-        self.client.set_row_height(sheet_name, 7, 8, report_styles.SECTION_ROW_HEIGHT)
-        self.client.format_range(sheet_name, 8, 11, 0, 6, **report_styles.BODY_FORMAT)
-        self.client.format_range(sheet_name, 8, 11, 0, 1, **report_styles.LABEL_FORMAT)
-        self.client.format_range(sheet_name, 8, 11, 2, 3, **report_styles.LABEL_FORMAT)
-        self.client.format_range(sheet_name, 8, 11, 4, 5, **report_styles.LABEL_FORMAT)
-        self.client.format_range(
-            sheet_name,
-            8,
-            9,
-            3,
-            4,
-            number_format=report_styles.MONEY_NUMBER_FORMAT,
-        )
-        self.client.format_range(
-            sheet_name,
-            8,
-            9,
-            5,
-            6,
-            number_format=report_styles.MONEY_NUMBER_FORMAT,
-        )
-        self.client.format_range(
-            sheet_name,
-            9,
-            10,
-            1,
-            2,
-            number_format=report_styles.PERCENT_NUMBER_FORMAT,
-        )
-
-        self.client.format_range(
-            sheet_name,
-            self.DETAIL_HEADER_ROW - 1,
-            self.DETAIL_HEADER_ROW,
-            0,
-            len(self.DETAIL_HEADERS),
-            **report_styles.TABLE_HEADER_FORMAT,
-        )
-        self.client.set_row_height(
-            sheet_name,
-            self.DETAIL_HEADER_ROW - 1,
-            self.DETAIL_HEADER_ROW,
-            report_styles.DETAIL_HEADER_ROW_HEIGHT,
-        )
-        self.client.freeze_rows(sheet_name, report_styles.FROZEN_TOP_ROWS)
+        requests: list[dict[str, Any]] = [
+            build_merge(sheet_id, 0, 1, 0, header_count),
+            build_merge(sheet_id, 7, 8, 0, 6),
+            build_merge(sheet_id, risk_title_row - 1, risk_title_row, 0, 4),
+            build_format(sheet_id, 0, 1, 0, header_count, **report_styles.TITLE_CELL_FORMAT),
+            build_row_height(sheet_id, 0, 1, report_styles.TITLE_ROW_HEIGHT),
+            build_format(sheet_id, 2, 6, 0, 1, **report_styles.LABEL_FORMAT),
+            build_format(sheet_id, 2, 6, 1, 2, **report_styles.BODY_FORMAT),
+            build_format(sheet_id, 7, 8, 0, 6, **report_styles.SECTION_TITLE_FORMAT),
+            build_row_height(sheet_id, 7, 8, report_styles.SECTION_ROW_HEIGHT),
+            build_format(sheet_id, 8, 11, 0, 6, **report_styles.BODY_FORMAT),
+            build_format(sheet_id, 8, 11, 0, 1, **report_styles.LABEL_FORMAT),
+            build_format(sheet_id, 8, 11, 2, 3, **report_styles.LABEL_FORMAT),
+            build_format(sheet_id, 8, 11, 4, 5, **report_styles.LABEL_FORMAT),
+            build_format(sheet_id, 8, 9, 3, 4, number_format=report_styles.MONEY_NUMBER_FORMAT),
+            build_format(sheet_id, 8, 9, 5, 6, number_format=report_styles.MONEY_NUMBER_FORMAT),
+            build_format(sheet_id, 9, 10, 1, 2, number_format=report_styles.PERCENT_NUMBER_FORMAT),
+            build_format(
+                sheet_id,
+                self.DETAIL_HEADER_ROW - 1,
+                self.DETAIL_HEADER_ROW,
+                0,
+                header_count,
+                **report_styles.TABLE_HEADER_FORMAT,
+            ),
+            build_row_height(
+                sheet_id,
+                self.DETAIL_HEADER_ROW - 1,
+                self.DETAIL_HEADER_ROW,
+                report_styles.DETAIL_HEADER_ROW_HEIGHT,
+            ),
+            self.client.build_freeze_rows_request(sheet_id, report_styles.FROZEN_TOP_ROWS),
+            build_format(
+                sheet_id, risk_title_row - 1, risk_title_row, 0, 4, **report_styles.SECTION_TITLE_FORMAT
+            ),
+            build_row_height(
+                sheet_id, risk_title_row - 1, risk_title_row, report_styles.SECTION_ROW_HEIGHT
+            ),
+            build_format(sheet_id, risk_title_row, risk_title_row + 3, 0, 2, **report_styles.BODY_FORMAT),
+            build_format(sheet_id, risk_title_row, risk_title_row + 3, 0, 1, **report_styles.LABEL_FORMAT),
+        ]
 
         if deal_count:
-            self.client.format_range(
-                sheet_name,
-                detail_row_start,
-                detail_row_end,
-                0,
-                len(self.DETAIL_HEADERS),
-                **report_styles.BODY_FORMAT,
-            )
-            self.client.format_range(
-                sheet_name,
-                detail_row_start,
-                detail_row_end,
-                3,
-                5,
-                **report_styles.CENTERED_BODY_FORMAT,
-            )
-            self.client.format_range(
-                sheet_name,
-                detail_row_start,
-                detail_row_end,
-                8,
-                12,
-                **report_styles.CENTERED_BODY_FORMAT,
-            )
-            self.client.format_range(
-                sheet_name,
-                detail_row_start,
-                detail_row_end,
-                5,
-                7,
-                number_format=report_styles.MONEY_NUMBER_FORMAT,
-            )
-            self.client.format_range(
-                sheet_name,
-                detail_row_start,
-                detail_row_end,
-                7,
-                8,
-                number_format=report_styles.PERCENT_NUMBER_FORMAT,
-            )
-            self.client.set_row_height(
-                sheet_name,
-                detail_row_start,
-                detail_row_end,
-                report_styles.DETAIL_ROW_HEIGHT,
+            requests.extend(
+                [
+                    build_format(
+                        sheet_id, detail_row_start, detail_row_end, 0, header_count, **report_styles.BODY_FORMAT
+                    ),
+                    build_format(
+                        sheet_id, detail_row_start, detail_row_end, 3, 5, **report_styles.CENTERED_BODY_FORMAT
+                    ),
+                    build_format(
+                        sheet_id, detail_row_start, detail_row_end, 8, 12, **report_styles.CENTERED_BODY_FORMAT
+                    ),
+                    build_format(
+                        sheet_id,
+                        detail_row_start,
+                        detail_row_end,
+                        5,
+                        7,
+                        number_format=report_styles.MONEY_NUMBER_FORMAT,
+                    ),
+                    build_format(
+                        sheet_id,
+                        detail_row_start,
+                        detail_row_end,
+                        7,
+                        8,
+                        number_format=report_styles.PERCENT_NUMBER_FORMAT,
+                    ),
+                    build_row_height(
+                        sheet_id, detail_row_start, detail_row_end, report_styles.DETAIL_ROW_HEIGHT
+                    ),
+                ]
             )
 
-        self.client.format_range(
-            sheet_name,
-            risk_title_row - 1,
-            risk_title_row,
-            0,
-            4,
-            **report_styles.SECTION_TITLE_FORMAT,
-        )
-        self.client.set_row_height(
-            sheet_name,
-            risk_title_row - 1,
-            risk_title_row,
-            report_styles.SECTION_ROW_HEIGHT,
-        )
-        self.client.format_range(
-            sheet_name,
-            risk_title_row,
-            risk_title_row + 3,
-            0,
-            2,
-            **report_styles.BODY_FORMAT,
-        )
-        self.client.format_range(
-            sheet_name,
-            risk_title_row,
-            risk_title_row + 3,
-            0,
-            1,
-            **report_styles.LABEL_FORMAT,
+        requests.extend(
+            build_column_width(sheet_id, column_index, column_index + 1, width_pixels)
+            for column_index, width_pixels in enumerate(report_styles.COLUMN_WIDTHS)
         )
 
-        for column_index, width_pixels in enumerate(report_styles.COLUMN_WIDTHS):
-            self.client.set_column_width(
-                sheet_name,
-                column_index,
-                column_index + 1,
-                width_pixels,
-            )
+        self.client.batch_update(
+            requests, action=f"applying formatting to sheet '{sheet_name}'"
+        )
 
-    def _cleanup_created_sheet(self, sheet_name: str) -> None:
+    def _cleanup_created_sheet(self, sheet_name: str, sheet_id: int) -> None:
         if sheet_name == "Sheet1":
             return
         if not sheet_name.startswith(f"{self.SHEET_PREFIX}_"):
             return
-        self.client.delete_sheet(sheet_name)
+        self.client.delete_sheet_by_id(sheet_id)
 
     def _deal_to_row(self, deal: CreditDeal) -> list[object]:
         return [

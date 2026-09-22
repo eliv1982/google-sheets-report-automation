@@ -12,7 +12,12 @@ This project was built as a homework-style automation exercise:
 - generate a formatted management report in a new sheet;
 - provide a simple `tkinter` desktop UI for running the process manually.
 
-All business data in the project is fully simulated and anonymized.
+All business data in the project is fully simulated and anonymized. The main
+report workflow never reads from or ingests any real data source — every
+deal in a generated report is produced internally by the offline data
+generator. The target spreadsheet itself is real (identified by
+`GOOGLE_SPREADSHEET_ID`), but its contents are written by the app, not read
+from an external system.
 
 ## Features
 
@@ -56,6 +61,11 @@ All business data in the project is fully simulated and anonymized.
 5. Store the file locally as `credentials/service-account.json`.
 6. Share the target Google Spreadsheet with the service account email and grant it Editor access.
 
+The client authenticates with the
+`https://www.googleapis.com/auth/spreadsheets` scope only. The application
+always operates on the single spreadsheet identified by
+`GOOGLE_SPREADSHEET_ID`; it never discovers or lists other spreadsheets.
+
 Do not commit the JSON key file to the repository.
 
 ## Safe Local Configuration
@@ -67,6 +77,11 @@ Do not commit the JSON key file to the repository.
 3. Keep `.env` local only.
 
 The repository is already configured so that `.env` and `credentials/` are not meant to be committed.
+
+Configuration loading uses `load_dotenv(..., override=False)`, so any
+`GOOGLE_APPLICATION_CREDENTIALS` or `GOOGLE_SPREADSHEET_ID` already present
+in the ambient shell/process environment takes precedence over the value in
+`.env`. Values from `.env` only fill in variables that are not already set.
 
 ## Installation
 
@@ -105,6 +120,17 @@ During generation the `Generate Report` button is temporarily disabled to preven
 ## Generated Report Structure
 
 Each report is created in a new sheet with a unique name such as `Report_20260715_163000`.
+Report generation always creates a brand-new worksheet and never overwrites
+an existing one; running the generator again creates another, separately
+named report sheet in the same spreadsheet.
+
+If report generation fails after the new sheet has been created (for
+example, a value-write or formatting call fails), the app attempts to
+delete that newly created sheet so a partial report is not left behind.
+This cleanup itself can fail (API errors, network issues, quota limits): if
+it does, the original report-generation error is still what gets reported
+to the user, and the cleanup failure is logged separately rather than
+being silently discarded or replacing the original error.
 
 The Google Sheets report contains:
 
@@ -150,13 +176,20 @@ Real FX APIs are not used anywhere in this project.
 
 ## Commands
 
-Read smoke-test:
+Read smoke-test (requires an explicit worksheet name; reads only a small,
+bounded `A1:E5` range by default, never the full sheet):
 
 ```powershell
-.\.venv\Scripts\python .\scripts\smoke_test_sheets.py
+.\.venv\Scripts\python .\scripts\smoke_test_sheets.py "Sheet1"
 ```
 
-Write smoke-test:
+Optional flags: `--range A1:C3` to read a different bounded range, and
+`--show-values` to explicitly print the values read (off by default — by
+default the script only reports connectivity and row count).
+
+Write smoke-test (creates a temporary worksheet, exercises write/read/format
+operations, then deletes the temporary worksheet; it only reports success
+and exits `0` after that cleanup delete has itself succeeded):
 
 ```powershell
 .\.venv\Scripts\python .\scripts\smoke_test_sheets_write.py
